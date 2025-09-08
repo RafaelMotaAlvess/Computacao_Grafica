@@ -1,5 +1,14 @@
+// Renderizador com suporte a OBJ preenchido (triângulos)
 #include <GL/freeglut.h>
 #include <string>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <cmath>
+
+// Forward declaration para função usada no fallback
+static void drawCubeColored();
 
 // Tamanho da janela
 static int g_width = 800;
@@ -14,6 +23,119 @@ static float g_scale = 1.0f;                         // escala
 static bool g_lmb_down = false; // botão esquerdo arrasta: rotacionar
 static bool g_rmb_down = false; // botão direito arrasta: transladar
 static int g_last_x = 0, g_last_y = 0;
+
+// OBJ: armazenamento simples (apenas v e f triangulares)
+static std::vector<float> g_vertices; // xyz intercalado
+static std::vector<unsigned int> g_indices; // triplas de índices 0-based
+static GLuint g_objList = 0;
+static bool g_objLoaded = false;
+
+static bool fileExists(const std::string& path) {
+    std::ifstream f(path);
+    return f.good();
+}
+
+static void computeFaceNormal(const float* a, const float* b, const float* c, float n[3]) {
+    const float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+    const float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+    n[0] = uy * vz - uz * vy;
+    n[1] = uz * vx - ux * vz;
+    n[2] = ux * vy - uy * vx;
+    const float len = std::sqrt(n[0]*n[0] + n[1]*n[1] + n[2]*n[2]);
+    if (len > 1e-8f) { n[0]/=len; n[1]/=len; n[2]/=len; }
+}
+
+// Carrega .obj básico (apenas 'v' e 'f' triangulares). Faces com slashes são suportadas.
+static bool loadObjToDisplayList(const std::string& path) {
+    g_vertices.clear();
+    g_indices.clear();
+
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        std::cerr << "Falha ao abrir OBJ: " << path << "\n";
+        return false;
+    }
+
+    std::string tok;
+    std::vector<float> tempVerts; tempVerts.reserve(1000);
+    std::vector<unsigned int> tempIdx; tempIdx.reserve(1000);
+    while (in >> tok) {
+        if (tok == "v") {
+            float x,y,z; in >> x >> y >> z;
+            tempVerts.push_back(x); tempVerts.push_back(y); tempVerts.push_back(z);
+        } else if (tok == "f") {
+            // Lê uma face; assume triangular para simplicidade
+            std::string a,b,c; in >> a >> b >> c;
+            auto parseIndex = [](const std::string& s)->unsigned int {
+                size_t slash = s.find('/') ;
+                std::string sub = (slash == std::string::npos ? s : s.substr(0, slash));
+                int idx1 = std::stoi(sub); // OBJ é 1-based
+                return (unsigned int)((idx1 > 0 ? idx1 - 1 : idx1));
+            };
+            unsigned int ia = parseIndex(a);
+            unsigned int ib = parseIndex(b);
+            unsigned int ic = parseIndex(c);
+            tempIdx.push_back(ia);
+            tempIdx.push_back(ib);
+            tempIdx.push_back(ic);
+        } else {
+            // Ignora outras linhas
+            std::string discard;
+            std::getline(in, discard);
+        }
+    }
+    in.close();
+
+    if (tempVerts.empty() || tempIdx.empty()) {
+        std::cerr << "OBJ vazio ou sem faces: " << path << "\n";
+        return false;
+    }
+
+    g_vertices.swap(tempVerts);
+    g_indices.swap(tempIdx);
+
+    if (g_objList != 0) {
+        glDeleteLists(g_objList, 1);
+        g_objList = 0;
+    }
+
+    // Cria display list com triângulos preenchidos e normais por face (se usar iluminação)
+    g_objList = glGenLists(1);
+    glNewList(g_objList, GL_COMPILE);
+    glPushMatrix();
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glDisable(GL_CULL_FACE);
+    glColor3f(0.85f, 0.85f, 0.9f);
+
+    glBegin(GL_TRIANGLES);
+    for (size_t i = 0; i + 2 < g_indices.size(); i += 3) {
+        const unsigned int ia = g_indices[i+0] * 3u;
+        const unsigned int ib = g_indices[i+1] * 3u;
+        const unsigned int ic = g_indices[i+2] * 3u;
+        const float* A = &g_vertices[ia];
+        const float* B = &g_vertices[ib];
+        const float* C = &g_vertices[ic];
+        float n[3]; computeFaceNormal(A, B, C, n);
+        glNormal3fv(n);
+        glVertex3fv(A); glVertex3fv(B); glVertex3fv(C);
+    }
+    glEnd();
+    glPopMatrix();
+    glEndList();
+
+    std::cout << "OBJ carregado: " << path << " | Verts: " << (g_vertices.size()/3) << " Tris: " << (g_indices.size()/3) << "\n";
+    return true;
+}
+
+static void drawOBJorFallback() {
+    if (g_objLoaded && g_objList != 0) {
+        // Apenas desenha o OBJ; configuração de luz fica no display()
+        glCallList(g_objList);
+    } else {
+        // Sem OBJ, desenha o cubo padrão
+        drawCubeColored();
+    }
+}
 
 static void drawBitmapText2D(float x, float y, const std::string& text) {
     glRasterPos2f(x, y);
@@ -163,6 +285,20 @@ static void display() {
     glEnable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
 
+    // Configuração de iluminação no espaço da câmera (antes das transformações do objeto)
+    glEnable(GL_LIGHTING);
+    glEnable(GL_LIGHT0);
+    glEnable(GL_NORMALIZE);
+    glEnable(GL_COLOR_MATERIAL);
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+
+    // Luz branca direcional/pontual fixa em relação à câmera
+    GLfloat lightPos[4] = {2.0f, 3.0f, 4.0f, 1.0f};
+    GLfloat lightCol[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,  lightCol);
+    glLightfv(GL_LIGHT0, GL_SPECULAR, lightCol);
+
     // Aplica transformações
     glTranslatef(g_tx, g_ty, g_tz);
     glRotatef(g_rx, 1,0,0);
@@ -170,8 +306,8 @@ static void display() {
     glRotatef(g_rz, 0,0,1);
     glScalef(g_scale, g_scale, g_scale);
 
-    // Cubo
-    drawCubeColored();
+    // Dsenha o arquivo obj
+    drawOBJorFallback();
 
     // Gizmo de eixos (fixo na tela)
     drawAxesGizmo();
@@ -261,6 +397,9 @@ int main(int argc, char** argv) {
     glutInitWindowSize(g_width, g_height);
     glutCreateWindow("Trabalho M1 - Rafael Mota e Kauan Adami");
 
+    // Define preenchimento por padrão
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
     // Declara callbacks
     glutDisplayFunc(display);
     glutReshapeFunc(reshape);
@@ -269,6 +408,14 @@ int main(int argc, char** argv) {
     glutMouseFunc(onMouse);
     glutMotionFunc(onMotion);
     glutIdleFunc(onIdle);
+
+    // Carrega OBJ se existir
+    std::string path = (argc > 1 ? std::string(argv[1]) : std::string("data/elepham.obj"));
+    if (fileExists(path)) {
+        g_objLoaded = loadObjToDisplayList(path);
+    } else {
+        std::cerr << "Arquivo OBJ nao encontrado: " << path << " (mostrando cubo de teste)\n";
+    }
 
     glutMainLoop();
     return 0;
