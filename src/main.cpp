@@ -1,4 +1,3 @@
-// Renderizador com suporte a OBJ preenchido (triângulos)
 #include <GL/freeglut.h>
 #include <string>
 #include <vector>
@@ -7,7 +6,6 @@
 #include <iostream>
 #include <cmath>
 
-// Forward declaration para função usada no fallback
 static void drawCubeColored();
 
 // Tamanho da janela
@@ -24,7 +22,6 @@ static bool g_lmb_down = false; // botão esquerdo arrasta: rotacionar
 static bool g_rmb_down = false; // botão direito arrasta: transladar
 static int g_last_x = 0, g_last_y = 0;
 
-// OBJ: armazenamento simples (apenas v e f triangulares)
 static std::vector<float> g_vertices; // xyz intercalado
 static std::vector<unsigned int> g_indices; // triplas de índices 0-based
 static GLuint g_objList = 0;
