@@ -38,12 +38,6 @@ cd build
 ```
 Obs.: Se preferir executar a partir da raiz do repositório, informe o caminho do OBJ explicitamente, por exemplo: `./build/main src/data/elepham.obj`.
 
-### Opção 2 — Compilar direto com g++
-```bash
-g++ -std=c++17 src/main.cpp src/obj_loader.cpp -o main -lGL -lGLU -lglut
-./main src/data/elepham.obj
-```
-
 ## Controles
 - W/S: transladar +Y/−Y
 - A/D: transladar −X/+X
