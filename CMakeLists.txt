@@ -4,7 +4,7 @@ project(MainOpenGL LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-add_executable(main src/main.cpp)
+add_executable(main src/main.cpp src/obj_loader.cpp)
 
 find_package(OpenGL REQUIRED)
 find_package(GLUT REQUIRED)
