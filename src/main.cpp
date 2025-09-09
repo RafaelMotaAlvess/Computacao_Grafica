@@ -5,6 +5,7 @@
 #include <sstream>
 #include <iostream>
 #include <cmath>
+#include <cstring>
 
 static void drawCubeColored();
 
@@ -22,9 +23,22 @@ static bool g_lmb_down = false; // botão esquerdo arrasta: rotacionar
 static bool g_rmb_down = false; // botão direito arrasta: transladar
 static int g_last_x = 0, g_last_y = 0;
 
-static std::vector<float> g_vertices; // xyz intercalado
-static std::vector<unsigned int> g_indices; // triplas de índices 0-based
-static std::vector<float> g_vnormals; // normais por vértice (xyz intercalado)
+static std::vector<float> g_vertices;       // posições: xyz intercalado
+static std::vector<unsigned int> g_indices; // índices (por posição) 0-based, para cálculo de normais fallback
+static std::vector<float> g_vnormals;       // normais calculadas por vértice (xyz intercalado)
+
+// Dados vindos diretamente do OBJ
+static std::vector<float> g_onormals;       // normais do arquivo (vn) xyz intercalado
+static std::vector<float> g_texcoords;      // coordenadas de textura (vt) uv intercalado
+
+// Triângulos (fan-triangulated) com índices separados para v, vt, vn
+struct Corner { int v, vt, vn; };
+static std::vector<Corner> g_triangles;     // a cada 3 entries = 1 tri
+
+// Textura simples (procedural) para demonstrar mapeamento UV
+static GLuint g_texID = 0;
+static bool g_texEnabled = true;            // alternar com tecla 'T'
+
 static GLuint g_objList = 0;
 static bool g_objLoaded = false;
 
@@ -43,11 +57,50 @@ static void computeFaceNormal(const float* a, const float* b, const float* c, fl
     if (len > 1e-8f) { n[0]/=len; n[1]/=len; n[2]/=len; }
 }
 
-// Carrega .obj básico (apenas 'v' e 'f' triangulares). Faces com slashes são suportadas.
+// Utilitário para converter índices OBJ (que podem ser negativos) para 0-based positivos
+static int toIndex0Based(int idxFromObj, int count) {
+    if (idxFromObj > 0) return idxFromObj - 1;     // 1..N -> 0..N-1
+    if (idxFromObj < 0) return count + idxFromObj; // -1 -> último
+    return -1; // 0 é inválido
+}
+
+// Cria textura xadrez (checkerboard) para demonstrar UVs sem depender de carregar imagem externa
+static void createCheckerTexture(int w = 64, int h = 64, int check = 8) {
+    if (g_texID != 0) {
+        glDeleteTextures(1, &g_texID);
+        g_texID = 0;
+    }
+    std::vector<unsigned char> img((size_t)w * h * 3u, 0);
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int cx = (x / check) & 1;
+            int cy = (y / check) & 1;
+            unsigned char c = (cx ^ cy) ? 230 : 50;
+            size_t i = (size_t)(y * w + x) * 3u;
+            img[i+0] = c;
+            img[i+1] = c;
+            img[i+2] = c;
+        }
+    }
+    glGenTextures(1, &g_texID);
+    glBindTexture(GL_TEXTURE_2D, g_texID);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    // Se houver suporte a mipmaps por extensão, podemos gerar mipmap
+    // Em fixed-function antigo, há gluBuild2DMipmaps disponível via GLU
+    gluBuild2DMipmaps(GL_TEXTURE_2D, GL_RGB, w, h, GL_RGB, GL_UNSIGNED_BYTE, img.data());
+}
+
+// Carrega .obj com suporte a v, vt, vn e f (triangulação em fan)
 static bool loadObjToDisplayList(const std::string& path) {
     g_vertices.clear();
     g_indices.clear();
     g_vnormals.clear();
+    g_onormals.clear();
+    g_texcoords.clear();
+    g_triangles.clear();
 
     std::ifstream in(path);
     if (!in.is_open()) {
@@ -57,20 +110,51 @@ static bool loadObjToDisplayList(const std::string& path) {
 
     std::string line;
     std::vector<float> tempVerts; tempVerts.reserve(1000);
+    std::vector<float> tempVNs;  tempVNs.reserve(1000);
+    std::vector<float> tempVTs;  tempVTs.reserve(1000);
     std::vector<unsigned int> tempIdx; tempIdx.reserve(1000);
 
-    auto parseIndex = [&](const std::string& s, int vcount)->int {
-        size_t slash = s.find('/');
-        std::string sub = (slash == std::string::npos ? s : s.substr(0, slash));
-        if (sub.empty()) return -1;
-        int idx1 = 0;
-        try { idx1 = std::stoi(sub); } catch (...) { return -1; }
-        int idx0 = 0;
-        if (idx1 > 0) idx0 = idx1 - 1;            // 1..N -> 0..N-1
-        else if (idx1 < 0) idx0 = vcount + idx1;  // -1 é o último
-        else return -1; // 0 não é válido
-        if (idx0 < 0 || idx0 >= vcount) return -1;
-        return idx0;
+    auto parseCorner = [&](const std::string& s, int vcount, int vtcount, int vncount)->Corner {
+        Corner c{ -1, -1, -1 };
+        // Formatos possíveis: v | v/vt | v//vn | v/vt/vn
+        // Vamos dividir até 3 partes
+        int parts[3] = {0,0,0};
+        int nparts = 0;
+        // Copiar para buffer mutável
+        char buf[128];
+        std::memset(buf, 0, sizeof(buf));
+        std::strncpy(buf, s.c_str(), sizeof(buf)-1);
+        char* p = buf; char* save = nullptr;
+        for (char* tok = ::strtok_r(p, "/", &save); tok != nullptr; tok = ::strtok_r(nullptr, "/", &save)) {
+            if (nparts < 3) {
+                parts[nparts] = std::atoi(tok);
+            }
+            ++nparts;
+        }
+        // Se havia // (v//vn) o strtok ignora vazio; precisamos detectar
+        // Heurística: contar slashes diretos no string
+        int slashCount = 0; for (char ch : s) if (ch == '/') ++slashCount;
+        bool hasDoubleSlash = (slashCount >= 2 && nparts == 2 && s.find("//") != std::string::npos);
+        if (nparts >= 1) {
+            int v0 = toIndex0Based(parts[0], vcount);
+            c.v = (v0 >= 0 && v0 < vcount) ? v0 : -1;
+        }
+        if (hasDoubleSlash) {
+            // v//vn
+            int vn0 = toIndex0Based(parts[1], vncount);
+            c.vn = (vn0 >= 0 && vn0 < vncount) ? vn0 : -1;
+        } else if (nparts == 2) {
+            // v/vt
+            int vt0 = toIndex0Based(parts[1], vtcount);
+            c.vt = (vt0 >= 0 && vt0 < vtcount) ? vt0 : -1;
+        } else if (nparts >= 3) {
+            // v/vt/vn
+            int vt0 = toIndex0Based(parts[1], vtcount);
+            int vn0 = toIndex0Based(parts[2], vncount);
+            c.vt = (vt0 >= 0 && vt0 < vtcount) ? vt0 : -1;
+            c.vn = (vn0 >= 0 && vn0 < vncount) ? vn0 : -1;
+        }
+        return c;
     };
 
     while (std::getline(in, line)) {
@@ -80,17 +164,36 @@ static bool loadObjToDisplayList(const std::string& path) {
         if (tok == "v") {
             float x=0,y=0,z=0; ls >> x >> y >> z;
             tempVerts.push_back(x); tempVerts.push_back(y); tempVerts.push_back(z);
+        } else if (tok == "vn") {
+            float x=0,y=0,z=0; ls >> x >> y >> z;
+            tempVNs.push_back(x); tempVNs.push_back(y); tempVNs.push_back(z);
+        } else if (tok == "vt") {
+            float u=0,v=0; ls >> u >> v; // ignorar w se houver
+            tempVTs.push_back(u); tempVTs.push_back(v);
         } else if (tok == "f") {
             // Lê todos os vértices da face e triangula em fan: (v0,v1,v2), (v0,v2,v3), ...
             std::vector<std::string> faceTokens;
             std::string fstr;
             while (ls >> fstr) faceTokens.push_back(fstr);
             if (faceTokens.size() < 3) continue;
-            std::vector<int> vind; vind.reserve(faceTokens.size());
-            const int vcount = (int)(tempVerts.size() / 3);
-            for (const auto& s : faceTokens) {
-                int idx0 = parseIndex(s, vcount);
-                if (idx0 >= 0) vind.push_back(idx0);
+            const int vcount  = (int)(tempVerts.size() / 3);
+            const int vtcount = (int)(tempVTs.size()  / 2);
+            const int vncount = (int)(tempVNs.size()  / 3);
+
+            std::vector<Corner> corners; corners.reserve(faceTokens.size());
+            for (const auto& s : faceTokens) corners.push_back(parseCorner(s, vcount, vtcount, vncount));
+
+            // Coleta índices de posição (para cálculo de normais fallback)
+            std::vector<int> vind; vind.reserve(corners.size());
+            for (const Corner& c : corners) if (c.v >= 0) vind.push_back(c.v);
+
+            // Triangula em fan utilizando os cantos completos (v,vt,vn)
+            if ((int)corners.size() >= 3) {
+                for (size_t k = 2; k < corners.size(); ++k) {
+                    g_triangles.push_back(corners[0]);
+                    g_triangles.push_back(corners[k-1]);
+                    g_triangles.push_back(corners[k]);
+                }
             }
             if ((int)vind.size() >= 3) {
                 for (size_t k = 2; k < vind.size(); ++k) {
@@ -112,6 +215,8 @@ static bool loadObjToDisplayList(const std::string& path) {
 
     g_vertices.swap(tempVerts);
     g_indices.swap(tempIdx);
+    g_onormals.swap(tempVNs);
+    g_texcoords.swap(tempVTs);
 
     // Calcula normais por vértice (média ponderada por área das faces adjacentes)
     g_vnormals.assign(g_vertices.size(), 0.0f);
@@ -140,34 +245,67 @@ static bool loadObjToDisplayList(const std::string& path) {
         g_objList = 0;
     }
 
-    // Cria display list com triângulos preenchidos e normais por VÉRTICE (suavização)
+    // Cria display list com triângulos preenchidos utilizando dados de OBJ (vn/vt) quando disponíveis
     g_objList = glGenLists(1);
     glNewList(g_objList, GL_COMPILE);
     glPushMatrix();
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
     glDisable(GL_CULL_FACE);
-    glColor3f(0.85f, 0.85f, 0.9f);
+    glColor3f(1.0f, 1.0f, 1.0f); // branco para não interferir na textura (modulate)
 
     glBegin(GL_TRIANGLES);
-    for (size_t i = 0; i + 2 < g_indices.size(); i += 3) {
-        const unsigned int ia = g_indices[i+0];
-        const unsigned int ib = g_indices[i+1];
-        const unsigned int ic = g_indices[i+2];
-        const float* A = &g_vertices[ia*3u];
-        const float* B = &g_vertices[ib*3u];
-        const float* C = &g_vertices[ic*3u];
-        const float* Na = &g_vnormals[ia*3u];
-        const float* Nb = &g_vnormals[ib*3u];
-        const float* Nc = &g_vnormals[ic*3u];
-        glNormal3fv(Na); glVertex3fv(A);
-        glNormal3fv(Nb); glVertex3fv(B);
-        glNormal3fv(Nc); glVertex3fv(C);
+    if (!g_triangles.empty()) {
+        const bool hasVN = !g_onormals.empty();
+        const bool hasVT = !g_texcoords.empty();
+        for (size_t i = 0; i + 2 < g_triangles.size(); i += 3) {
+            for (int corner = 0; corner < 3; ++corner) {
+                const Corner& c = g_triangles[i + corner];
+                // normal: preferir vn do arquivo; senão, usar normal por vértice calculada
+                if (hasVN && c.vn >= 0) {
+                    const float* N = &g_onormals[(size_t)c.vn * 3u];
+                    glNormal3fv(N);
+                } else if (c.v >= 0) {
+                    const float* N = &g_vnormals[(size_t)c.v * 3u];
+                    glNormal3fv(N);
+                }
+                // texcoord
+                if (hasVT && c.vt >= 0) {
+                    const float* T = &g_texcoords[(size_t)c.vt * 2u];
+                    glTexCoord2fv(T);
+                }
+                // posição
+                if (c.v >= 0) {
+                    const float* P = &g_vertices[(size_t)c.v * 3u];
+                    glVertex3fv(P);
+                }
+            }
+        }
+    } else {
+        // Fallback (não deveria ocorrer se indices foram preenchidos), usa apenas os índices de posição
+        for (size_t i = 0; i + 2 < g_indices.size(); i += 3) {
+            const unsigned int ia = g_indices[i+0];
+            const unsigned int ib = g_indices[i+1];
+            const unsigned int ic = g_indices[i+2];
+            const float* A = &g_vertices[ia*3u];
+            const float* B = &g_vertices[ib*3u];
+            const float* C = &g_vertices[ic*3u];
+            const float* Na = &g_vnormals[ia*3u];
+            const float* Nb = &g_vnormals[ib*3u];
+            const float* Nc = &g_vnormals[ic*3u];
+            glNormal3fv(Na); glVertex3fv(A);
+            glNormal3fv(Nb); glVertex3fv(B);
+            glNormal3fv(Nc); glVertex3fv(C);
+        }
     }
     glEnd();
     glPopMatrix();
     glEndList();
 
-    std::cout << "OBJ carregado: " << path << " | Verts: " << (g_vertices.size()/3) << " Tris: " << (g_indices.size()/3) << "\n";
+    std::cout << "OBJ carregado: " << path
+              << " | V: " << (g_vertices.size()/3)
+              << " VT: " << (g_texcoords.size()/2)
+              << " VN: " << (g_onormals.size()/3)
+              << " | Tris: " << (g_triangles.size()/3) << "\n";
     return true;
 }
 
@@ -302,6 +440,7 @@ static void drawHelpOverlay() {
     line("Setas: Rotacionar em X/Y");
     line("Z/X: Rotacionar em Z");
     line("+/−: Aumentar/Diminuir escala");
+    line("T: Alternar textura ON/OFF");
     line("Mouse Esq: arrastar p/ rotacionar");
     line("Mouse Dir: arrastar p/ transladar");
     line("Scroll: Aproximar/Afastar");
@@ -345,6 +484,15 @@ static void display() {
     glLightfv(GL_LIGHT0, GL_DIFFUSE,  lightCol);
     glLightfv(GL_LIGHT0, GL_SPECULAR, lightCol);
 
+    // Textura
+    if (g_texEnabled && g_texID != 0 && !g_texcoords.empty()) {
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, g_texID);
+        glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    } else {
+        glDisable(GL_TEXTURE_2D);
+    }
+
     // Aplica transformações
     glTranslatef(g_tx, g_ty, g_tz);
     glRotatef(g_rx, 1,0,0);
@@ -384,6 +532,7 @@ static void onKeyboard(unsigned char key, int, int) {
         case 'z': case 'Z': g_rz -= 5.0f; break;
         case 'x': case 'X': g_rz += 5.0f; break;
         case 'r': case 'R': resetTransform(); break;
+        case 't': case 'T': g_texEnabled = !g_texEnabled; break;
         case 27: /* ESC */ exit(0);
         default: break;
     }
@@ -456,12 +605,15 @@ int main(int argc, char** argv) {
     glutIdleFunc(onIdle);
 
     // Carrega OBJ se existir
-    std::string path = (argc > 1 ? std::string(argv[1]) : std::string("data/porsche.obj"));
+    std::string path = (argc > 1 ? std::string(argv[1]) : std::string("data/teddy.obj"));
     if (fileExists(path)) {
         g_objLoaded = loadObjToDisplayList(path);
     } else {
         std::cerr << "Arquivo OBJ nao encontrado: " << path << " (mostrando cubo de teste)\n";
     }
+
+    // Cria textura de teste
+    createCheckerTexture();
 
     glutMainLoop();
     return 0;
