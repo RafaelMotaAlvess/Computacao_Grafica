@@ -24,6 +24,7 @@ static int g_last_x = 0, g_last_y = 0;
 
 static std::vector<float> g_vertices; // xyz intercalado
 static std::vector<unsigned int> g_indices; // triplas de índices 0-based
+static std::vector<float> g_vnormals; // normais por vértice (xyz intercalado)
 static GLuint g_objList = 0;
 static bool g_objLoaded = false;
 
@@ -46,6 +47,7 @@ static void computeFaceNormal(const float* a, const float* b, const float* c, fl
 static bool loadObjToDisplayList(const std::string& path) {
     g_vertices.clear();
     g_indices.clear();
+    g_vnormals.clear();
 
     std::ifstream in(path);
     if (!in.is_open()) {
@@ -53,32 +55,52 @@ static bool loadObjToDisplayList(const std::string& path) {
         return false;
     }
 
-    std::string tok;
+    std::string line;
     std::vector<float> tempVerts; tempVerts.reserve(1000);
     std::vector<unsigned int> tempIdx; tempIdx.reserve(1000);
-    while (in >> tok) {
+
+    auto parseIndex = [&](const std::string& s, int vcount)->int {
+        size_t slash = s.find('/');
+        std::string sub = (slash == std::string::npos ? s : s.substr(0, slash));
+        if (sub.empty()) return -1;
+        int idx1 = 0;
+        try { idx1 = std::stoi(sub); } catch (...) { return -1; }
+        int idx0 = 0;
+        if (idx1 > 0) idx0 = idx1 - 1;            // 1..N -> 0..N-1
+        else if (idx1 < 0) idx0 = vcount + idx1;  // -1 é o último
+        else return -1; // 0 não é válido
+        if (idx0 < 0 || idx0 >= vcount) return -1;
+        return idx0;
+    };
+
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ls(line);
+        std::string tok; ls >> tok;
         if (tok == "v") {
-            float x,y,z; in >> x >> y >> z;
+            float x=0,y=0,z=0; ls >> x >> y >> z;
             tempVerts.push_back(x); tempVerts.push_back(y); tempVerts.push_back(z);
         } else if (tok == "f") {
-            // Lê uma face; assume triangular para simplicidade
-            std::string a,b,c; in >> a >> b >> c;
-            auto parseIndex = [](const std::string& s)->unsigned int {
-                size_t slash = s.find('/') ;
-                std::string sub = (slash == std::string::npos ? s : s.substr(0, slash));
-                int idx1 = std::stoi(sub); // OBJ é 1-based
-                return (unsigned int)((idx1 > 0 ? idx1 - 1 : idx1));
-            };
-            unsigned int ia = parseIndex(a);
-            unsigned int ib = parseIndex(b);
-            unsigned int ic = parseIndex(c);
-            tempIdx.push_back(ia);
-            tempIdx.push_back(ib);
-            tempIdx.push_back(ic);
+            // Lê todos os vértices da face e triangula em fan: (v0,v1,v2), (v0,v2,v3), ...
+            std::vector<std::string> faceTokens;
+            std::string fstr;
+            while (ls >> fstr) faceTokens.push_back(fstr);
+            if (faceTokens.size() < 3) continue;
+            std::vector<int> vind; vind.reserve(faceTokens.size());
+            const int vcount = (int)(tempVerts.size() / 3);
+            for (const auto& s : faceTokens) {
+                int idx0 = parseIndex(s, vcount);
+                if (idx0 >= 0) vind.push_back(idx0);
+            }
+            if ((int)vind.size() >= 3) {
+                for (size_t k = 2; k < vind.size(); ++k) {
+                    tempIdx.push_back((unsigned int)vind[0]);
+                    tempIdx.push_back((unsigned int)vind[k-1]);
+                    tempIdx.push_back((unsigned int)vind[k]);
+                }
+            }
         } else {
             // Ignora outras linhas
-            std::string discard;
-            std::getline(in, discard);
         }
     }
     in.close();
@@ -91,12 +113,34 @@ static bool loadObjToDisplayList(const std::string& path) {
     g_vertices.swap(tempVerts);
     g_indices.swap(tempIdx);
 
+    // Calcula normais por vértice (média ponderada por área das faces adjacentes)
+    g_vnormals.assign(g_vertices.size(), 0.0f);
+    for (size_t i = 0; i + 2 < g_indices.size(); i += 3) {
+        const unsigned int ia = g_indices[i+0] * 3u;
+        const unsigned int ib = g_indices[i+1] * 3u;
+        const unsigned int ic = g_indices[i+2] * 3u;
+        if (ia+2 >= g_vertices.size() || ib+2 >= g_vertices.size() || ic+2 >= g_vertices.size()) continue;
+        const float* A = &g_vertices[ia];
+        const float* B = &g_vertices[ib];
+        const float* C = &g_vertices[ic];
+        float n[3]; computeFaceNormal(A, B, C, n);
+        g_vnormals[ia+0] += n[0]; g_vnormals[ia+1] += n[1]; g_vnormals[ia+2] += n[2];
+        g_vnormals[ib+0] += n[0]; g_vnormals[ib+1] += n[1]; g_vnormals[ib+2] += n[2];
+        g_vnormals[ic+0] += n[0]; g_vnormals[ic+1] += n[1]; g_vnormals[ic+2] += n[2];
+    }
+    for (size_t v = 0; v + 2 < g_vnormals.size(); v += 3) {
+        float nx = g_vnormals[v+0], ny = g_vnormals[v+1], nz = g_vnormals[v+2];
+        float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+        if (len > 1e-8f) { g_vnormals[v+0] = nx/len; g_vnormals[v+1] = ny/len; g_vnormals[v+2] = nz/len; }
+        else { g_vnormals[v+0] = 0; g_vnormals[v+1] = 0; g_vnormals[v+2] = 1; }
+    }
+
     if (g_objList != 0) {
         glDeleteLists(g_objList, 1);
         g_objList = 0;
     }
 
-    // Cria display list com triângulos preenchidos e normais por face (se usar iluminação)
+    // Cria display list com triângulos preenchidos e normais por VÉRTICE (suavização)
     g_objList = glGenLists(1);
     glNewList(g_objList, GL_COMPILE);
     glPushMatrix();
@@ -106,15 +150,18 @@ static bool loadObjToDisplayList(const std::string& path) {
 
     glBegin(GL_TRIANGLES);
     for (size_t i = 0; i + 2 < g_indices.size(); i += 3) {
-        const unsigned int ia = g_indices[i+0] * 3u;
-        const unsigned int ib = g_indices[i+1] * 3u;
-        const unsigned int ic = g_indices[i+2] * 3u;
-        const float* A = &g_vertices[ia];
-        const float* B = &g_vertices[ib];
-        const float* C = &g_vertices[ic];
-        float n[3]; computeFaceNormal(A, B, C, n);
-        glNormal3fv(n);
-        glVertex3fv(A); glVertex3fv(B); glVertex3fv(C);
+        const unsigned int ia = g_indices[i+0];
+        const unsigned int ib = g_indices[i+1];
+        const unsigned int ic = g_indices[i+2];
+        const float* A = &g_vertices[ia*3u];
+        const float* B = &g_vertices[ib*3u];
+        const float* C = &g_vertices[ic*3u];
+        const float* Na = &g_vnormals[ia*3u];
+        const float* Nb = &g_vnormals[ib*3u];
+        const float* Nc = &g_vnormals[ic*3u];
+        glNormal3fv(Na); glVertex3fv(A);
+        glNormal3fv(Nb); glVertex3fv(B);
+        glNormal3fv(Nc); glVertex3fv(C);
     }
     glEnd();
     glPopMatrix();
@@ -288,6 +335,8 @@ static void display() {
     glEnable(GL_NORMALIZE);
     glEnable(GL_COLOR_MATERIAL);
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+    glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_TRUE);
+    glShadeModel(GL_SMOOTH);
 
     // Luz branca direcional/pontual fixa em relação à câmera
     GLfloat lightPos[4] = {2.0f, 3.0f, 4.0f, 1.0f};
@@ -407,7 +456,7 @@ int main(int argc, char** argv) {
     glutIdleFunc(onIdle);
 
     // Carrega OBJ se existir
-    std::string path = (argc > 1 ? std::string(argv[1]) : std::string("data/elepham.obj"));
+    std::string path = (argc > 1 ? std::string(argv[1]) : std::string("data/porsche.obj"));
     if (fileExists(path)) {
         g_objLoaded = loadObjToDisplayList(path);
     } else {
